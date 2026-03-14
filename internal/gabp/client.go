@@ -1,6 +1,7 @@
 package gabp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -100,57 +101,53 @@ func NewClient(log util.Logger) *Client {
 	}
 }
 
-func (c *Client) Connect(addr string, token string, backoffMin, backoffMax time.Duration) error {
+// Connect dials the GABP server and performs the handshake.
+// Retries with exponential backoff until ctx is cancelled.
+func (c *Client) Connect(ctx context.Context, addr string, token string, backoffMin, backoffMax time.Duration) error {
 	c.token = token
 
-	// Connect with retry/backoff
 	var conn net.Conn
 	var err error
 
-	// Implement proper exponential backoff with jitter
-	// Respects backoffMin and backoffMax parameters with exponential growth
-	// and randomized jitter to avoid thundering herd problems when multiple games
-	// try to connect simultaneously.
-	for attempts := 0; attempts < 5; attempts++ {
-		conn, err = net.Dial("tcp", addr)
+	for attempts := 0; ; attempts++ {
+		if ctx.Err() != nil {
+			return fmt.Errorf("connect cancelled: %w", ctx.Err())
+		}
+
+		var d net.Dialer
+		conn, err = d.DialContext(ctx, "tcp", addr)
 		if err == nil {
 			break
 		}
 		c.log.Warnw("connection attempt failed", "attempt", attempts+1, "error", err)
-		
-		// Don't wait after the last attempt
-		if attempts == 4 {
-			break
+
+		if ctx.Err() != nil {
+			return fmt.Errorf("connect cancelled after %d attempts: %w", attempts+1, ctx.Err())
 		}
-		
-		// Calculate exponential backoff: backoffMin * 2^attempts
+
 		multiplier := math.Pow(2, float64(attempts))
 		backoffDelay := time.Duration(float64(backoffMin) * multiplier)
-		
-		// Cap at backoffMax
 		if backoffDelay > backoffMax {
 			backoffDelay = backoffMax
 		}
-		
-		// Add jitter: ±25% randomization to prevent thundering herd
+
+		// Add ±25% jitter
 		jitterRange := float64(backoffDelay) * 0.25
 		jitter := time.Duration(rand.Float64()*2*jitterRange - jitterRange)
 		finalDelay := backoffDelay + jitter
-		
-		// Ensure we never go below backoffMin or above backoffMax
 		if finalDelay < backoffMin {
 			finalDelay = backoffMin
 		}
 		if finalDelay > backoffMax {
 			finalDelay = backoffMax
 		}
-		
-		c.log.Debugw("backing off before retry", "attempt", attempts+1, "delay", finalDelay, "baseDelay", backoffDelay)
-		time.Sleep(finalDelay)
-	}
 
-	if err != nil {
-		return fmt.Errorf("failed to connect after retries: %w", err)
+		c.log.Debugw("backing off before retry", "attempt", attempts+1, "delay", finalDelay)
+		select {
+		case <-time.After(finalDelay):
+		case <-ctx.Done():
+			return fmt.Errorf("connect cancelled during backoff: %w", ctx.Err())
+		}
 	}
 
 	c.conn = conn
@@ -260,6 +257,10 @@ func (c *Client) handleEvent(msg *util.GABPMessage) {
 }
 
 func (c *Client) sendRequest(method string, params interface{}) (interface{}, error) {
+	return c.sendRequestWithTimeout(method, params, 30*time.Second)
+}
+
+func (c *Client) sendRequestWithTimeout(method string, params interface{}, timeout time.Duration) (interface{}, error) {
 	req := util.NewGABPRequest(method, params)
 
 	// Register response channel
@@ -287,8 +288,8 @@ func (c *Client) sendRequest(method string, params interface{}) (interface{}, er
 			return nil, fmt.Errorf("GABP error %d: %s", resp.Error.Code, resp.Error.Message)
 		}
 		return resp.Result, nil
-	case <-time.After(30 * time.Second):
-		return nil, fmt.Errorf("request timeout")
+	case <-time.After(timeout):
+		return nil, fmt.Errorf("request timeout after %s", timeout)
 	}
 }
 
@@ -301,27 +302,122 @@ type ToolDescriptor struct {
 	Tags         []string               `json:"tags,omitempty"`
 }
 
+// ToolParameter represents a tool parameter from Lib.GAB
+type ToolParameter struct {
+	Name         string      `json:"name"`
+	Type         string      `json:"type"`
+	Description  string      `json:"description,omitempty"`
+	Required     bool        `json:"required"`
+	DefaultValue interface{} `json:"defaultValue,omitempty"`
+}
+
+// ToolDescriptorRaw is the raw format from Lib.GAB
+type ToolDescriptorRaw struct {
+	Name         string                 `json:"name"`
+	Description  string                 `json:"description,omitempty"`
+	Parameters   []ToolParameter        `json:"parameters,omitempty"`
+	OutputSchema map[string]interface{} `json:"outputSchema,omitempty"`
+	RequiresAuth bool                   `json:"requiresAuth,omitempty"`
+}
+
+// convertToToolDescriptor converts a raw Lib.GAB tool descriptor to MCP format
+func convertToToolDescriptor(raw ToolDescriptorRaw) ToolDescriptor {
+	properties := make(map[string]interface{})
+	required := []string{}
+
+	for _, p := range raw.Parameters {
+		prop := map[string]interface{}{
+			"type": mapTypeToJSONSchema(p.Type),
+		}
+		if p.Description != "" {
+			prop["description"] = p.Description
+		}
+		if p.DefaultValue != nil {
+			prop["default"] = p.DefaultValue
+		}
+		properties[p.Name] = prop
+
+		if p.Required {
+			required = append(required, p.Name)
+		}
+	}
+
+	inputSchema := map[string]interface{}{
+		"type":       "object",
+		"properties": properties,
+	}
+	if len(required) > 0 {
+		inputSchema["required"] = required
+	}
+
+	return ToolDescriptor{
+		Name:         raw.Name,
+		Description:  raw.Description,
+		InputSchema:  inputSchema,
+		OutputSchema: raw.OutputSchema,
+	}
+}
+
+// mapTypeToJSONSchema converts C# type names to JSON Schema types
+func mapTypeToJSONSchema(typeName string) string {
+	switch typeName {
+	case "String", "string":
+		return "string"
+	case "Int32", "Int64", "int", "long":
+		return "integer"
+	case "Single", "Double", "float", "double":
+		return "number"
+	case "Boolean", "bool":
+		return "boolean"
+	default:
+		return "string"
+	}
+}
+
 func (c *Client) ListTools() ([]ToolDescriptor, error) {
 	result, err := c.sendRequest("tools/list", map[string]interface{}{})
 	if err != nil {
 		return nil, err
 	}
 
-	var tools []ToolDescriptor
-	if err := mapToStruct(result, &tools); err != nil {
+	// The response is { "tools": [...] }, so extract the tools array
+	resultMap, ok := result.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected response type: %T", result)
+	}
+
+	toolsData, exists := resultMap["tools"]
+	if !exists {
+		return []ToolDescriptor{}, nil
+	}
+
+	// Parse as raw format from Lib.GAB
+	var rawTools []ToolDescriptorRaw
+	if err := mapToStruct(toolsData, &rawTools); err != nil {
 		return nil, fmt.Errorf("failed to parse tools: %w", err)
+	}
+
+	// Convert to MCP format
+	tools := make([]ToolDescriptor, len(rawTools))
+	for i, raw := range rawTools {
+		tools[i] = convertToToolDescriptor(raw)
 	}
 
 	return tools, nil
 }
 
 func (c *Client) CallTool(name string, args map[string]any) (map[string]any, bool, error) {
+	return c.CallToolWithTimeout(name, args, 30*time.Second)
+}
+
+// CallToolWithTimeout calls a tool with a custom timeout
+func (c *Client) CallToolWithTimeout(name string, args map[string]any, timeout time.Duration) (map[string]any, bool, error) {
 	params := map[string]interface{}{
 		"name":       name,
 		"parameters": args,
 	}
 
-	result, err := c.sendRequest("tools/call", params)
+	result, err := c.sendRequestWithTimeout("tools/call", params, timeout)
 	if err != nil {
 		return nil, true, err
 	}
